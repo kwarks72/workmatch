@@ -1,0 +1,4 @@
+﻿task_id,task_name,base_per_hour,base_error_rate
+1,포장,40,0.02
+2,조립,20,0.04
+3,검수,30,0.01

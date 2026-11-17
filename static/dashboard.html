@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>WorkMatch</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  body { font-family: 'Malgun Gothic', sans-serif; background: #f4f6fb; margin: 0; padding: 24px; color: #222; }
+  h1 { margin: 0 0 4px; }
+  .sub { color: #667; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: #fff; border-radius: 12px; padding: 18px; box-shadow: 0 1px 4px rgba(0,0,0,.08); min-width: 0; }
+  .card h2 { margin-top: 0; font-size: 18px; }
+  .full { grid-column: 1 / 3; }
+  label { display: inline-block; width: 90px; }
+  input { width: 70px; padding: 4px; margin: 3px 0; }
+  button { background: #2f5bea; color: #fff; border: 0; border-radius: 8px; padding: 10px 18px; font-size: 15px; cursor: pointer; margin-top: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 14px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid #eee; text-align: left; }
+  th { background: #f0f3fb; }
+  .ok { color: #1a8f4c; font-weight: bold; }
+  .warn { color: #d93025; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>WorkMatch · AI 작업 배분 ERP</h1>
+<div class="sub">작업자의 능력과 근무시간에 맞춰 오늘의 작업과 물량을 자동으로 배분합니다</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>① 오늘 근무시간</h2>
+    <div id="hoursBox"></div>
+  </div>
+  <div class="card">
+    <h2>② 오늘 주문 물량</h2>
+    <div id="demandBox"></div>
+    <button onclick="runAllocate()">자동 배분 실행</button>
+  </div>
+
+  <div class="card full">
+    <h2>③ 오늘의 작업지시서</h2>
+    <div id="result">값을 확인하고 [자동 배분 실행]을 눌러 주세요.</div>
+  </div>
+
+  <div class="card full">
+    <h2>④ 오늘 실적 입력 → AI 다시 학습</h2>
+    <div>
+      <label>날짜</label><input type="date" id="recDate" style="width:150px">
+      <label style="width:60px;margin-left:16px">작업자</label><select id="recWorker"></select>
+      <label style="width:40px;margin-left:16px">작업</label><select id="recTask"></select>
+    </div>
+    <div>
+      <label>근무시간</label><input type="number" id="recHours" value="8" step="0.5" min="0.5">
+      <label style="width:70px;margin-left:16px">실제 수량</label><input type="number" id="recActual" value="0" min="1">
+      <label style="width:60px;margin-left:16px">불량 수</label><input type="number" id="recDefect" value="0" min="0">
+    </div>
+    <button onclick="saveRecord()">실적 저장</button>
+    <button onclick="retrain()" style="background:#1a8f4c;margin-left:8px">AI 다시 학습</button>
+    <div id="recMsg" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <h2>작업자별 평균 달성률(%)</h2>
+    <canvas id="achChart"></canvas>
+  </div>
+  <div class="card">
+    <h2>작업자별 평균 오류율(%)</h2>
+    <canvas id="errChart"></canvas>
+  </div>
+</div>
+
+<script>
+const DEFAULT_DEMAND = { "포장": 500, "조립": 200, "검수": 350 };
+let achChart, errChart;
+
+async function init() {
+  const workers = await (await fetch("/workers")).json();
+  const wt = await (await fetch("/summary/worker-task")).json();
+  const tasks = [...new Set(wt.map(r => r.task_name))];
+
+  document.getElementById("hoursBox").innerHTML = workers.map(w =>
+    `<div><label>${w.name}</label>
+     <input type="number" min="0" max="12" step="0.5" value="8" class="hoursInput" data-name="${w.name}"> 시간</div>`
+  ).join("");
+
+  document.getElementById("demandBox").innerHTML = tasks.map(t =>
+    `<div><label>${t}</label>
+     <input type="number" min="0" step="10" value="${DEFAULT_DEMAND[t] || 0}" class="demandInput" data-task="${t}"> 개</div>`
+  ).join("");
+
+  fillRecordForm(workers, tasks);
+  drawCharts();
+}
+
+async function runAllocate() {
+  const avail_hours = {};
+  const demand = {};
+  document.querySelectorAll(".hoursInput").forEach(i => avail_hours[i.dataset.name] = parseFloat(i.value) || 0);
+  document.querySelectorAll(".demandInput").forEach(i => demand[i.dataset.task] = parseFloat(i.value) || 0);
+
+  const res = await fetch("/allocate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ avail_hours, demand })
+  });
+  const box = document.getElementById("result");
+  if (!res.ok) { box.textContent = "계산 실패 (코드 " + res.status + ")"; return; }
+  const data = await res.json();
+
+  let html = "<table><tr><th>작업자</th><th>작업</th><th>시간</th><th>예상 수량</th><th>예상 불량</th></tr>";
+  data.schedule.forEach(s => {
+    html += `<tr><td>${s.name}</td><td>${s.task_name}</td><td>${s.hours}h</td>
+             <td>${s.planned_qty}개</td><td>${s.expected_defects}개</td></tr>`;
+  });
+  html += "</table>";
+
+  html += "<table><tr><th>작업</th><th>주문 물량</th><th>배정 물량</th><th>상태</th></tr>";
+  data.summary.forEach(s => {
+    const status = s.shortage > 0
+      ? `<span class="warn">부족 ${s.shortage}개</span>`
+      : `<span class="ok">달성</span>`;
+    html += `<tr><td>${s.task_name}</td><td>${s.demand}개</td><td>${s.planned_qty}개</td><td>${status}</td></tr>`;
+  });
+  html += "</table>";
+  html += `<b>예상 총 불량: ${data.total_expected_defects}개</b>`;
+  box.innerHTML = html;
+}
+
+async function drawCharts() {
+  const rows = await (await fetch("/summary/workers")).json();
+  const names = rows.map(r => r.name);
+  if (achChart) achChart.destroy();
+  if (errChart) errChart.destroy();
+  achChart = new Chart(document.getElementById("achChart"), {
+    type: "bar",
+    data: { labels: names, datasets: [{ label: "달성률(%)", data: rows.map(r => r.avg_achievement), backgroundColor: "#2f5bea" }] }
+  });
+  errChart = new Chart(document.getElementById("errChart"), {
+    type: "bar",
+    data: { labels: names, datasets: [{ label: "오류율(%)", data: rows.map(r => r.avg_error), backgroundColor: "#e8710a" }] }
+  });
+}
+
+function fillRecordForm(workers, tasks) {
+  document.getElementById("recDate").value = new Date().toISOString().slice(0, 10);
+  document.getElementById("recWorker").innerHTML = workers.map(w => `<option>${w.name}</option>`).join("");
+  document.getElementById("recTask").innerHTML = tasks.map(t => `<option>${t}</option>`).join("");
+}
+
+async function saveRecord() {
+  const msg = document.getElementById("recMsg");
+  const body = {
+    work_date: document.getElementById("recDate").value,
+    name: document.getElementById("recWorker").value,
+    task_name: document.getElementById("recTask").value,
+    hours: parseFloat(document.getElementById("recHours").value),
+    actual_qty: parseInt(document.getElementById("recActual").value),
+    defect_qty: parseInt(document.getElementById("recDefect").value),
+  };
+  const res = await fetch("/records", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    const why = typeof data.detail === "string" ? data.detail : "입력값을 확인해 주세요";
+    msg.innerHTML = `<span class="warn">${why}</span>`;
+    return;
+  }
+  msg.innerHTML = `<span class="ok">저장 완료</span> — 달성률 ${data.achievement_rate}%, 오류율 ${data.error_rate}%`;
+  drawCharts();
+}
+
+async function retrain() {
+  const msg = document.getElementById("recMsg");
+  msg.textContent = "학습 중... (몇 초 걸립니다)";
+  const res = await fetch("/retrain", { method: "POST" });
+  if (!res.ok) { msg.innerHTML = `<span class="warn">학습 실패 (코드 ${res.status})</span>`; return; }
+  const data = await res.json();
+  msg.innerHTML = `<span class="ok">학습 완료</span> — 사용한 실적 ${data.records_used}건 / `
+    + `처리량 오차 ${data.mae.qty_per_hour} / 오류율 오차 ${data.mae.error_rate}. `
+    + `이제 [자동 배분 실행]을 다시 눌러 보세요.`;
+}
+
+init();
+</script>
+</body>
+</html>
